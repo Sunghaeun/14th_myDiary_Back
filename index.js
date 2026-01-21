@@ -3,12 +3,9 @@
 // - PORT는 Render가 process.env.PORT로 주입함
 // - DB 없이 메모리(in-memory)로 동작: 서버 재시작 시 데이터 초기화됨
 
-const { OAuth2Client } = require("google-auth-library");
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
-
-
 const express = require("express");
 const cors = require("cors");
+const axios = require("axios"); // ✅ 추가
 
 const app = express();
 app.use(cors());
@@ -22,7 +19,6 @@ let nextMemberId = 1;
 // email -> { memberId, name, email, password }
 const membersByEmail = new Map();
 
-// 간단 로그인 상태(세션/토큰 없이 구현)
 // email -> isLogined(0/1)
 const loginState = new Map();
 
@@ -37,7 +33,6 @@ function isValidString(v) {
 }
 
 function normalizeDate(date) {
-  // 아주 단순 체크 (YYYY-MM-DD 형태만 허용)
   if (!isValidString(date)) return null;
   const s = date.trim();
   const ok = /^\d{4}-\d{2}-\d{2}$/.test(s);
@@ -45,7 +40,6 @@ function normalizeDate(date) {
 }
 
 function normalizeTodo(todo) {
-  // 입력이 배열이면 그대로(문자열만), 문자열이면 , 기준으로 배열화
   if (Array.isArray(todo)) {
     return todo
       .map((x) => (typeof x === "string" ? x.trim() : ""))
@@ -69,7 +63,6 @@ function getHaveArrays() {
     if (Array.isArray(entry.todo) && entry.todo.length > 0) haveTodos.push(date);
   }
 
-  // 날짜 정렬
   haveContents.sort();
   haveTodos.sort();
 
@@ -80,37 +73,27 @@ function getHaveArrays() {
 // Routes
 // --------------------
 app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    message: "Server is running",
-  });
+  res.json({ ok: true, message: "Server is running" });
 });
 
 // 회원가입
-// POST /SignUp
-// body: { email, name, password }
-// res: { memberId, name, email }
 app.post("/SignUp", (req, res) => {
   const { email, name, password } = req.body || {};
 
   if (!isValidString(email) || !isValidString(name) || !isValidString(password)) {
-    return res.status(400).json({
-      error: "email, name, password are required",
-    });
+    return res.status(400).json({ error: "email, name, password are required" });
   }
 
   const key = email.trim().toLowerCase();
   if (membersByEmail.has(key)) {
-    return res.status(409).json({
-      error: "email already exists",
-    });
+    return res.status(409).json({ error: "email already exists" });
   }
 
   const member = {
     memberId: nextMemberId++,
     name: name.trim(),
     email: key,
-    password: String(password), // 데모용: 해싱/암호화 안 함
+    password: String(password),
   };
 
   membersByEmail.set(key, member);
@@ -123,10 +106,7 @@ app.post("/SignUp", (req, res) => {
   });
 });
 
-// 로그인
-// POST /Login
-// body: { email, password }
-// res: { message: "...", isLogined: 1 }
+// 일반 로그인
 app.post("/Login", (req, res) => {
   const { email, password } = req.body || {};
   if (!isValidString(email) || !isValidString(password)) {
@@ -148,46 +128,79 @@ app.post("/Login", (req, res) => {
   });
 });
 
-// 구글 로그인
+// --------------------
+// ✅ 구글 로그인 (code 방식)
 // POST /Login/google
-// body: { idToken }
+// body: { code }
+// --------------------
 app.post("/Login/google", async (req, res) => {
-  const { idToken } = req.body || {};
+  console.log("HIT /Login/google", req.body);
+  const { code } = req.body || {};
 
-  if (!idToken) {
-    return res.status(400).json({ error: "idToken is required" });
+  if (!isValidString(code)) {
+    return res.status(400).json({ error: "code is required" });
+  }
+
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const redirectUri = process.env.GOOGLE_REDIRECT_URI;
+
+  if (!isValidString(clientId) || !isValidString(clientSecret) || !isValidString(redirectUri)) {
+    return res.status(500).json({
+      error: "Google env vars missing",
+      detail: "GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REDIRECT_URI 확인 필요",
+    });
   }
 
   try {
-    // 1. Google 토큰 검증
-    const ticket = await googleClient.verifyIdToken({
-      idToken,
-      audience: process.env.GOOGLE_CLIENT_ID,
+    // 1) code -> token 교환
+    // 구글 토큰 엔드포인트는 application/x-www-form-urlencoded 를 가장 안정적으로 받음
+    const params = new URLSearchParams();
+    params.append("code", code);
+    params.append("client_id", clientId);
+    params.append("client_secret", clientSecret);
+    params.append("redirect_uri", redirectUri);
+    params.append("grant_type", "authorization_code");
+
+    const tokenRes = await axios.post("https://oauth2.googleapis.com/token", params, {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
     });
 
-    const payload = ticket.getPayload();
-    const email = payload.email;
-    const name = payload.name || "Google User";
-
-    if (!email) {
-      return res.status(400).json({ error: "email not found in token" });
+    const { access_token } = tokenRes.data;
+    if (!access_token) {
+      return res.status(401).json({ error: "no access_token from google" });
     }
 
-    const key = email.toLowerCase();
+    // 2) userinfo 가져오기
+    const userRes = await axios.get("https://www.googleapis.com/oauth2/v2/userinfo", {
+      headers: { Authorization: `Bearer ${access_token}` },
+    });
 
-    // 2. 회원 없으면 자동 회원가입
+    const { email, name } = userRes.data || {};
+    if (!email) {
+      return res.status(401).json({ error: "email not found from userinfo" });
+    }
+
+    const key = String(email).toLowerCase();
+    const displayName = isValidString(name) ? name : "Google User";
+
+    // 3) 회원 없으면 자동 회원가입
     if (!membersByEmail.has(key)) {
       const member = {
         memberId: nextMemberId++,
-        name,
+        name: displayName,
         email: key,
-        password: null, // 구글 로그인은 비밀번호 없음
+        password: null,
       };
       membersByEmail.set(key, member);
       loginState.set(key, 0);
+    } else {
+      // 기존 회원인데 이름이 비어있으면 갱신(선택)
+      const m = membersByEmail.get(key);
+      if (m && !isValidString(m.name)) m.name = displayName;
     }
 
-    // 3. 로그인 처리
+    // 4) 로그인 처리
     loginState.set(key, 1);
     const member = membersByEmail.get(key);
 
@@ -198,14 +211,15 @@ app.post("/Login/google", async (req, res) => {
       email: member.email,
     });
   } catch (err) {
-    console.error(err);
-    return res.status(401).json({ error: "Invalid Google token" });
+    console.error("Google OAuth failed:", err.response?.data || err.message);
+    return res.status(401).json({
+      error: "Google OAuth failed",
+      detail: err.response?.data || err.message,
+    });
   }
 });
 
-// 로그아웃 (스크린샷에 /Home 라우트로 표시되어 있어서 그대로 구현)
-// POST /Home
-// body: { email }  (데모용: 어떤 유저를 로그아웃할지)
+// 로그아웃
 app.post("/Home", (req, res) => {
   const { email } = req.body || {};
   if (isValidString(email)) {
@@ -216,17 +230,12 @@ app.post("/Home", (req, res) => {
 });
 
 // 달력에 할일/일기 존재 여부 표시
-// GET /Home
-// res: { haveContents:[...], haveTodos:[...] }
 app.get("/Home", (req, res) => {
   const { haveContents, haveTodos } = getHaveArrays();
   return res.json({ haveContents, haveTodos });
 });
 
 // 다이어리 추가
-// POST /diary/:date
-// body: { todo, contents, thanks }
-// res: { haveContents: true/false, haveTodos: true/false }
 app.post("/diary/:date", (req, res) => {
   const date = normalizeDate(req.params.date);
   if (!date) return res.status(400).json({ error: "invalid date format (YYYY-MM-DD)" });
@@ -249,8 +258,6 @@ app.post("/diary/:date", (req, res) => {
 });
 
 // 다이어리 불러오기
-// GET /diary/:date
-// res: { todo: [...], contents: "...", thanks: "..." }
 app.get("/diary/:date", (req, res) => {
   const date = normalizeDate(req.params.date);
   if (!date) return res.status(400).json({ error: "invalid date format (YYYY-MM-DD)" });
@@ -260,9 +267,6 @@ app.get("/diary/:date", (req, res) => {
 });
 
 // 다이어리 수정
-// PUT /diary/:date
-// body: { todo, contents, thanks }
-// res: { haveContents: true/false, haveTodos: true/false }
 app.put("/diary/:date", (req, res) => {
   const date = normalizeDate(req.params.date);
   if (!date) return res.status(400).json({ error: "invalid date format (YYYY-MM-DD)" });
