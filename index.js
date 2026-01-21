@@ -133,12 +133,15 @@ app.post("/Login", (req, res) => {
 // POST /Login/google
 // body: { code }
 // --------------------
-app.post("/Login/google", async (req, res) => {
-  console.log("HIT /Login/google", req.body);
-  const { code } = req.body || {};
+// ✅ 구글 로그인 (code 방식) - JSON body로 token 교환
+// POST /auth/google
+// body: { code }
+app.post("/auth/google", async (req, res) => {
+  console.log("HIT /auth/google", req.body);
 
+  const { code } = req.body || {};
   if (!isValidString(code)) {
-    return res.status(400).json({ error: "code is required" });
+    return res.status(400).json({ message: "code 없음" });
   }
 
   const clientId = process.env.GOOGLE_CLIENT_ID;
@@ -147,28 +150,33 @@ app.post("/Login/google", async (req, res) => {
 
   if (!isValidString(clientId) || !isValidString(clientSecret) || !isValidString(redirectUri)) {
     return res.status(500).json({
-      error: "Google env vars missing",
+      message: "Google env vars missing",
       detail: "GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REDIRECT_URI 확인 필요",
     });
   }
 
   try {
-    // 1) code -> token 교환
-    // 구글 토큰 엔드포인트는 application/x-www-form-urlencoded 를 가장 안정적으로 받음
-    const params = new URLSearchParams();
-    params.append("code", code);
-    params.append("client_id", clientId);
-    params.append("client_secret", clientSecret);
-    params.append("redirect_uri", redirectUri);
-    params.append("grant_type", "authorization_code");
+    // 1) code -> access_token 교환 (JSON 형식)
+    const tokenRes = await axios.post(
+      "https://oauth2.googleapis.com/token",
+      {
+        code: String(code).trim(),
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: redirectUri, // ⭐️ 반드시 프론트에서 code 만들 때 쓴 redirect_uri와 동일
+        grant_type: "authorization_code",
+      },
+      {
+        headers: { "Content-Type": "application/json" },
+      }
+    );
 
-    const tokenRes = await axios.post("https://oauth2.googleapis.com/token", params, {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    });
-
-    const { access_token } = tokenRes.data;
+    const { access_token } = tokenRes.data || {};
     if (!access_token) {
-      return res.status(401).json({ error: "no access_token from google" });
+      return res.status(401).json({
+        message: "no access_token from google",
+        detail: tokenRes.data,
+      });
     }
 
     // 2) userinfo 가져오기
@@ -178,7 +186,7 @@ app.post("/Login/google", async (req, res) => {
 
     const { email, name } = userRes.data || {};
     if (!email) {
-      return res.status(401).json({ error: "email not found from userinfo" });
+      return res.status(401).json({ message: "email not found from userinfo" });
     }
 
     const key = String(email).toLowerCase();
@@ -195,7 +203,7 @@ app.post("/Login/google", async (req, res) => {
       membersByEmail.set(key, member);
       loginState.set(key, 0);
     } else {
-      // 기존 회원인데 이름이 비어있으면 갱신(선택)
+      // 기존 회원인데 이름 비어있으면 갱신(선택)
       const m = membersByEmail.get(key);
       if (m && !isValidString(m.name)) m.name = displayName;
     }
@@ -211,13 +219,14 @@ app.post("/Login/google", async (req, res) => {
       email: member.email,
     });
   } catch (err) {
-    console.error("Google OAuth failed:", err.response?.data || err.message);
-    return res.status(401).json({
-      error: "Google OAuth failed",
+    console.error("Google OAuth 실패:", err.response?.data || err.message);
+    return res.status(500).json({
+      message: "Google OAuth 실패",
       detail: err.response?.data || err.message,
     });
   }
 });
+
 
 // 로그아웃
 app.post("/Home", (req, res) => {
